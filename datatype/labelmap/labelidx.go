@@ -70,6 +70,7 @@ func (k indexKey) VersionedCtx() *datastore.VersionedCtx {
 }
 
 // returns nil if no Meta is found.
+// should only call getCachedLabelIndex external to this file.
 func getLabelIndex(ctx *datastore.VersionedCtx, label uint64) (*labels.Index, error) {
 	timedLog := dvid.NewTimeLog()
 	store, err := datastore.GetKeyValueDB(ctx.Data())
@@ -100,6 +101,7 @@ func getLabelIndex(ctx *datastore.VersionedCtx, label uint64) (*labels.Index, er
 	return idx, nil
 }
 
+// should only call putCachedLabelIndex external to this file.
 func putLabelIndex(ctx *datastore.VersionedCtx, idx *labels.Index) error {
 	timedLog := dvid.NewTimeLog()
 	store, err := datastore.GetOrderedKeyValueDB(ctx.Data())
@@ -143,7 +145,9 @@ func getCachedLabelIndex(d dvid.Data, v dvid.VersionID, label uint64) (*labels.I
 
 	var err error
 	var idxBytes []byte
+	var timedLog dvid.TimeLog
 	if indexCache != nil {
+		timedLog = dvid.NewTimeLog()
 		idxBytes, err = indexCache.Get(k.Bytes())
 		if err != nil && err != freecache.ErrNotFound {
 			return nil, err
@@ -156,6 +160,10 @@ func getCachedLabelIndex(d dvid.Data, v dvid.VersionID, label uint64) (*labels.I
 			return nil, err
 		}
 		atomic.AddUint64(&metaHits, 1)
+		curHits := atomic.LoadUint64(&metaHits)
+		curAttempts := atomic.LoadUint64(&metaAttempts)
+		hitRate := float64(10000*curHits/curAttempts) / 100.0
+		timedLog.Infof("label %d index hit, %d bytes (total %d hits / %d attempts - %4.2f%%)", label, len(idxBytes), curHits, curAttempts, hitRate)
 		return idx, nil
 	}
 	idx, err = getLabelIndex(k.VersionedCtx(), label)
@@ -172,6 +180,10 @@ func getCachedLabelIndex(d dvid.Data, v dvid.VersionID, label uint64) (*labels.I
 		} else if err := indexCache.Set(k.Bytes(), idxBytes, 0); err != nil {
 			dvid.Errorf("unable to set label %d index cache for %q: %v\n", label, d.DataName(), err)
 		}
+		curHits := atomic.LoadUint64(&metaHits)
+		curAttempts := atomic.LoadUint64(&metaAttempts)
+		hitRate := float64(10000*curHits/curAttempts) / 100.0
+		timedLog.Infof("label %d index miss, %d bytes (total %d hits / %d attempts - %4.2f%%)", label, len(idxBytes), curHits, curAttempts, hitRate)
 	}
 	if idx.Label != label {
 		dvid.Criticalf("label index for data %q, label %d has internal label value %d\n", d.DataName(), label, idx.Label)

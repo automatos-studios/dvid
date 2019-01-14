@@ -242,7 +242,7 @@ GET  <api URL>/node/<UUID>/<data name>/specificblocks[?queryopts]
         int32  Block 1 coordinate Y
         int32  Block 1 coordinate Z
         int32  # bytes for first block (N1)
-        byte0  Bytes of block data in jpeg-compressed format.
+        byte0  Bytes of block data in compressed format.
         byte1
         ...
         byteN1
@@ -251,14 +251,14 @@ GET  <api URL>/node/<UUID>/<data name>/specificblocks[?queryopts]
         int32  Block 2 coordinate Y
         int32  Block 2 coordinate Z
         int32  # bytes for second block (N2)
-        byte0  Bytes of block data in jpeg-compressed format.
+        byte0  Bytes of block data in compressed format.
         byte1
         ...
         byteN2
 
         ...
 
-    If no data is available for given block span, nothing is returned.
+    If a block is not available, no data will be returned for it.
 
     Arguments:
 
@@ -375,7 +375,7 @@ GET  <api URL>/node/<UUID>/<data name>/raw/<dims>/<size>/<offset>[/<format>][?qu
 POST <api URL>/node/<UUID>/<data name>/raw/0_1_2/<size>/<offset>[?queryopts]
 
     Ingests block-aligned supervoxel data using the block sizes defined for this data instance.  
-    For example, if the BlockSize = 32, offset and size must by multiples of 32.
+    For example, if the BlockSize = 32, offset and size must be multiples of 32.
 
     Example: 
 
@@ -553,7 +553,7 @@ GET <api URL>/node/<UUID>/<data name>/blocks/<size>/<offset>[?queryopts]
 
         ...
 
-    If no data is available for given block span, nothing is returned.
+	If a block is not available, no data will be returned for it.
 
     Arguments:
 
@@ -1982,33 +1982,35 @@ func writeBlock(w http.ResponseWriter, bcoord dvid.ChunkPoint3d, out []byte) err
 }
 
 // sendBlocksSpecific writes data to the blocks specified -- best for non-ordered backend
-func (d *Data) sendBlocksSpecific(ctx *datastore.VersionedCtx, w http.ResponseWriter, supervoxels bool, compression, blockstring string, scale uint8) error {
+func (d *Data) sendBlocksSpecific(ctx *datastore.VersionedCtx, w http.ResponseWriter, supervoxels bool, compression, blockstring string, scale uint8) (numBlocks int, err error) {
 	switch compression {
 	case "":
 		compression = "blocks"
 	case "lz4", "gzip", "blocks", "uncompressed":
 		break
 	default:
-		return fmt.Errorf(`compression must be "lz4" (default), "gzip", "blocks" or "uncompressed"`)
+		err = fmt.Errorf(`compression must be "lz4" (default), "gzip", "blocks" or "uncompressed"`)
+		return
 	}
 
 	w.Header().Set("Content-type", "application/octet-stream")
 	// extract querey string
 	if blockstring == "" {
-		return nil
+		return
 	}
 	coordarray := strings.Split(blockstring, ",")
 	if len(coordarray)%3 != 0 {
-		return fmt.Errorf("block query string should be three coordinates per block")
+		return 0, fmt.Errorf("block query string should be three coordinates per block")
 	}
 
-	store, err := datastore.GetKeyValueDB(d)
+	var store storage.KeyValueDB
+	store, err = datastore.GetKeyValueDB(d)
 	if err != nil {
-		return fmt.Errorf("Data type labelblk had error initializing store: %v", err)
+		return
 	}
 
 	// launch goroutine that will stream blocks to client
-	numBlocks := len(coordarray) / 3
+	numBlocks = len(coordarray) / 3
 	wg := new(sync.WaitGroup)
 
 	ch := make(chan blockSend, numBlocks)
@@ -2017,7 +2019,7 @@ func (d *Data) sendBlocksSpecific(ctx *datastore.VersionedCtx, w http.ResponseWr
 		for data := range ch {
 			if data.err != nil && sendErr == nil {
 				sendErr = data.err
-			} else {
+			} else if len(data.value) > 0 {
 				err := writeBlock(w, data.bcoord, data.value)
 				if err != nil && sendErr == nil {
 					sendErr = err
@@ -2029,17 +2031,18 @@ func (d *Data) sendBlocksSpecific(ctx *datastore.VersionedCtx, w http.ResponseWr
 
 	// iterate through each block, get data from store, and transcode based on request parameters
 	for i := 0; i < len(coordarray); i += 3 {
-		xloc, err := strconv.Atoi(coordarray[i])
+		var xloc, yloc, zloc int
+		xloc, err = strconv.Atoi(coordarray[i])
 		if err != nil {
-			return err
+			return
 		}
-		yloc, err := strconv.Atoi(coordarray[i+1])
+		yloc, err = strconv.Atoi(coordarray[i+1])
 		if err != nil {
-			return err
+			return
 		}
-		zloc, err := strconv.Atoi(coordarray[i+2])
+		zloc, err = strconv.Atoi(coordarray[i+2])
 		if err != nil {
-			return err
+			return
 		}
 		bcoord := dvid.ChunkPoint3d{int32(xloc), int32(yloc), int32(zloc)}
 
@@ -2071,7 +2074,7 @@ func (d *Data) sendBlocksSpecific(ctx *datastore.VersionedCtx, w http.ResponseWr
 
 	wg.Wait()
 	close(ch)
-	return sendErr
+	return numBlocks, sendErr
 }
 
 // returns nil block if no block is at the given block coordinate
@@ -2955,7 +2958,7 @@ func getScale(queryStrings url.Values) (scale uint8, err error) {
 }
 
 // ServeHTTP handles all incoming HTTP requests for this data.
-func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request) {
+func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request) (activity map[string]interface{}) {
 	// Get the action (GET, POST)
 	action := strings.ToLower(r.Method)
 
@@ -3047,11 +3050,15 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 		}
 		if action == "get" {
 			timedLog := dvid.NewTimeLog()
-			if err := d.sendBlocksSpecific(ctx, w, supervoxels, compression, blocklist, scale); err != nil {
+			numBlocks, err := d.sendBlocksSpecific(ctx, w, supervoxels, compression, blocklist, scale)
+			if err != nil {
 				server.BadRequest(w, r, err)
 				return
 			}
 			timedLog.Infof("HTTP %s: %s", r.Method, r.URL)
+			activity = map[string]interface{}{
+				"num_blocks": numBlocks,
+			}
 		} else {
 			server.BadRequest(w, r, "DVID does not accept the %s action on the 'specificblocks' endpoint", action)
 			return
@@ -3148,6 +3155,7 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 	default:
 		server.BadAPIRequest(w, r, d)
 	}
+	return
 }
 
 // --------- Handler functions for HTTP requests --------------
@@ -3427,13 +3435,13 @@ func (d *Data) handleIndex(ctx *datastore.VersionedCtx, w http.ResponseWriter, r
 			timedLog.Infof("HTTP POST index for label %d (%s) -- empty index so deleted index", label, r.URL)
 			return
 		}
-		if err := putLabelIndex(ctx, idx); err != nil {
+		if err := putCachedLabelIndex(d, ctx.VersionID(), idx); err != nil {
 			server.BadRequest(w, r, err)
 			return
 		}
 
 	case "get":
-		idx, err := getLabelIndex(ctx, label)
+		idx, err := getCachedLabelIndex(d, ctx.VersionID(), label)
 		if err != nil {
 			server.BadRequest(w, r, err)
 			return
@@ -3514,7 +3522,7 @@ func (d *Data) handleIngestIndices(ctx *datastore.VersionedCtx, w http.ResponseW
 			continue
 		}
 		idx := labels.Index{LabelIndex: *protoIdx}
-		if err := putLabelIndex(ctx, &idx); err != nil {
+		if err := putCachedLabelIndex(d, ctx.VersionID(), &idx); err != nil {
 			server.BadRequest(w, r, err)
 			return
 		}

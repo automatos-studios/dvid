@@ -2579,13 +2579,13 @@ func (d *Data) resyncLowMemory(ctx *datastore.VersionedCtx) {
 	if numTagE > 0 {
 		totTagE += numTagE
 		if err := d.storeTags(batcher, ctx, tagE); err != nil {
-			dvid.Errorf("Error writing final set of tags of data %q: %v", err)
+			dvid.Errorf("Error writing final set of tags of data %q: %v", d.DataName(), err)
 		}
 	}
 	if numBlockE > 0 {
 		totBlockE += numBlockE
 		if err := d.storeLabels(batcher, ctx, blockE); err != nil {
-			dvid.Errorf("Error writing final set of label elements of data %q: %v", err)
+			dvid.Errorf("Error writing final set of label elements of data %q: %v", d.DataName(), err)
 		}
 	}
 
@@ -2701,7 +2701,7 @@ func (d *Data) DoRPC(req datastore.Request, reply *datastore.Response) error {
 }
 
 // ServeHTTP handles all incoming HTTP requests for this data.
-func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request) {
+func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request) (activity map[string]interface{}) {
 	timedLog := dvid.NewTimeLog()
 	// versionID := ctx.VersionID()
 
@@ -2982,4 +2982,5 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 	default:
 		server.BadAPIRequest(w, r, d)
 	}
+	return
 }

@@ -262,7 +262,7 @@ GET  <api URL>/node/<UUID>/<data name>/raw/<dims>/<size>/<offset>[/<format>][?qu
 POST <api URL>/node/<UUID>/<data name>/raw/0_1_2/<size>/<offset>[?queryopts]
 
     Puts block-aligned voxel data using the block sizes defined for  this data instance.  
-    For example, if the BlockSize = 32, offset and size must by multiples of 32.
+    For example, if the BlockSize = 32, offset and size must be multiples of 32.
 
     Example: 
 
@@ -1240,7 +1240,7 @@ func checkContentHash(hash string, data []byte) error {
 }
 
 // ServeHTTP handles all incoming HTTP requests for this data.
-func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request) {
+func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request) (activity map[string]interface{}) {
 	// TODO -- Refactor this method to break it up and make it simpler.  Use the web routing for the endpoints.
 
 	timedLog := dvid.NewTimeLog()
@@ -1616,6 +1616,7 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 	default:
 		server.BadAPIRequest(w, r, d)
 	}
+	return
 }
 
 // --------- Other functions on labelblk Data -----------------

@@ -448,7 +448,7 @@ func (d *Data) DoRPC(request datastore.Request, reply *datastore.Response) error
 }
 
 // ServeHTTP handles all incoming HTTP requests for this data.
-func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request) {
+func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request) (activity map[string]interface{}) {
 	timedLog := dvid.NewTimeLog()
 
 	// Break URL request into arguments
@@ -602,7 +602,7 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 				server.BadRequest(w, r, err)
 				return
 			}
-			comment = fmt.Sprintf("HTTP POST keyvalue '%s': %d bytes (%s)\n", d.DataName(), len(data), url)
+			comment = fmt.Sprintf("HTTP POST keyvalue '%s': %d bytes (%s)", d.DataName(), len(data), url)
 		default:
 			server.BadRequest(w, r, "key endpoint does not support %q HTTP verb", action)
 			return
@@ -614,6 +614,7 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 	}
 
 	timedLog.Infof(comment)
+	return
 }
 
 func (d *Data) handleKeyValues(w http.ResponseWriter, r *http.Request, uuid dvid.UUID, ctx *datastore.VersionedCtx) (numKeys, writtenBytes int, err error) {
