@@ -152,6 +152,12 @@ POST  /api/server/reload-metadata
 	when prompted by an external coordinator, allowing the "slave" DVIDs to see changes made by
 	the master DVID.
 
+GET /api/server/blobstore/{reference}
+   
+	GETs data with the given reference string from this server's blobstore. The blobstore is
+	populated as part of mutation logging and is read-only.  The reference is a URL-friendly 
+	content hash (FNV-128) of the blob data.
+
 -------------------------
 Memory Profiler endpoints
 -------------------------
@@ -240,6 +246,11 @@ Repo-Level REST endpoints
 	The log is a list of strings that will be appended to the repo's log.  They should be
 	descriptions for the entire repo and not just one node.  For particular versions, use
 	node-level logging (below).
+
+  GET /api/repo/{uuid}/branch-versions/{branch name}
+
+	Returns a JSON list of version UUIDs for the given branch name, starting with the
+	current leaf and working back to the root.  Use "master" for the default branch.
 
  POST /api/repo/{uuid}/merge
 
@@ -554,7 +565,7 @@ func serveHTTP() {
 	} else if fullwrite {
 		mode = " (full write mode)"
 	}
-	dvid.Infof("Web server listening at %s%s ...\n", config.HTTPAddress(), mode)
+	dvid.Infof("Web server listening at %s%s ...\n", HTTPAddress(), mode)
 	if !webMux.routesSetup {
 		initRoutes()
 	}
@@ -568,7 +579,7 @@ func serveHTTP() {
 	// of server is more important.
 
 	s := &http.Server{
-		Addr:         config.HTTPAddress(),
+		Addr:         HTTPAddress(),
 		WriteTimeout: WriteTimeout,
 		ReadTimeout:  ReadTimeout,
 	}
@@ -626,6 +637,7 @@ func initRoutes() {
 	serverMux.Post("/api/server/settings", serverSettingsHandler)
 	serverMux.Post("/api/server/reload-metadata", serverReload)
 	serverMux.Post("/api/server/reload-metadata/", serverReload)
+	serverMux.Get("/api/server/blobstore/:ref", blobstoreHandler)
 
 	if !readonly {
 		mainMux.Post("/api/repos", reposPostHandler)
@@ -640,10 +652,14 @@ func initRoutes() {
 
 	repoMux := web.New()
 	mainMux.Handle("/api/repo/:uuid/:action", repoMux)
+	mainMux.Handle("/api/repo/:uuid/:action/:name", repoMux)
+	repoMux.Use(repoRawSelector)
+	repoMux.Use(mutationsHandler)
 	repoMux.Use(activityLogHandler)
 	repoMux.Use(repoSelector)
 	repoMux.Get("/api/repo/:uuid/info", repoInfoHandler)
 	repoMux.Post("/api/repo/:uuid/instance", repoNewDataHandler)
+	repoMux.Get("/api/repo/:uuid/branch-versions/:name", repoBranchVersionsHandler)
 	repoMux.Get("/api/repo/:uuid/log", getRepoLogHandler)
 	repoMux.Post("/api/repo/:uuid/log", postRepoLogHandler)
 	repoMux.Post("/api/repo/:uuid/merge", repoMergeHandler)
@@ -652,8 +668,9 @@ func initRoutes() {
 	nodeMux := web.New()
 	mainMux.Handle("/api/node/:uuid", nodeMux)
 	mainMux.Handle("/api/node/:uuid/:action", nodeMux)
-	nodeMux.Use(activityLogHandler)
 	nodeMux.Use(repoRawSelector)
+	nodeMux.Use(mutationsHandler)
+	nodeMux.Use(activityLogHandler)
 	nodeMux.Use(nodeSelector)
 	nodeMux.Get("/api/node/:uuid/note", getNodeNoteHandler)
 	nodeMux.Post("/api/node/:uuid/note", postNodeNoteHandler)
@@ -669,6 +686,7 @@ func initRoutes() {
 	mainMux.Handle("/api/node/:uuid/:dataname/:keyword", instanceMux)
 	mainMux.Handle("/api/node/:uuid/:dataname/:keyword/*", instanceMux)
 	instanceMux.Use(repoRawSelector)
+	instanceMux.Use(mutationsHandler)
 	instanceMux.Use(instanceSelector)
 	instanceMux.NotFound(notFound)
 
@@ -748,6 +766,50 @@ func recoverHandler(c *web.C, h http.Handler) http.Handler {
 	return http.HandlerFunc(fn)
 }
 
+// Middleware that logs all mutations to any configured mutation log
+func mutationsHandler(c *web.C, h http.Handler) http.Handler {
+	mutConfig := MutationLogSpec()
+	fn := func(w http.ResponseWriter, r *http.Request) {
+		if mutConfig.Logstore != "" {
+			buf, err := ioutil.ReadAll(r.Body)
+			if err != nil {
+				BadRequest(w, r, "unable to read POST for mirroring: %v", err)
+				return
+			}
+			dup := make([]byte, len(buf))
+			copy(dup, buf)
+			r.Body = ioutil.NopCloser(bytes.NewBuffer(dup))
+
+			uuid, ok := c.Env["uuid"].(dvid.UUID)
+			if !ok {
+				msg := fmt.Sprintf("Bad format for UUID %q\n", c.Env["uuid"])
+				BadRequest(w, r, msg)
+				return
+			}
+			var dataID dvid.UUID
+			dataname := c.Env["dataname"]
+			if dataname != nil {
+				instancename, ok := dataname.(dvid.InstanceName)
+				if !ok {
+					BadRequest(w, r, "bad data instance name")
+				}
+				data, err := datastore.GetDataByUUIDName(uuid, instancename)
+				if err != nil {
+					BadRequest(w, r, err)
+					return
+				}
+				dataID = data.DataUUID()
+			}
+			if err := LogMutation(uuid, dataID, r, buf); err != nil {
+				BadRequest(w, r, err)
+				return
+			}
+		}
+		h.ServeHTTP(w, r)
+	}
+	return http.HandlerFunc(fn)
+}
+
 // Middleware that logs activity to kafka if available.
 func activityLogHandler(c *web.C, h http.Handler) http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
@@ -785,14 +847,7 @@ func notFound(w http.ResponseWriter, r *http.Request) {
 // BadAPIRequest writes a standard error message to http.ResponseWriter for a badly formatted API call.
 func BadAPIRequest(w http.ResponseWriter, r *http.Request, d dvid.Data) {
 	helpURL := path.Join("api", "help", string(d.TypeName()))
-	var host string
-	config := GetConfig()
-	if config == nil {
-		host = "unknown - config unset"
-	} else {
-		host = config.Host()
-	}
-	msg := fmt.Sprintf("Bad API call (%s) for data %q.  See API help at http://%s/%s", r.URL.Path, d.DataName(), host, helpURL)
+	msg := fmt.Sprintf("Bad API call (%s) for data %q.  See API help at http://%s/%s", r.URL.Path, d.DataName(), Host(), helpURL)
 	http.Error(w, msg, http.StatusBadRequest)
 	dvid.Errorf("Bad API call (%s) for data %q\n", r.URL.Path, d.DataName())
 }
@@ -858,6 +913,7 @@ func repoRawSelector(c *web.C, h http.Handler) http.Handler {
 			return
 		}
 		c.Env["uuid"] = uuid
+		c.Env["name"] = c.URLParams["name"]
 
 		h.ServeHTTP(w, r)
 	}
@@ -1016,7 +1072,7 @@ func instanceSelector(c *web.C, h http.Handler) http.Handler {
 		}
 
 		// TODO: setup routing for data instances as well.
-		if config != nil && config.AllowTiming() {
+		if AllowTiming() {
 			w.Header().Set("Timing-Allow-Origin", "*")
 		}
 
@@ -1119,7 +1175,7 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
 	// Serve from embedded files in executable if not web client directory was specified
-	if config.WebClient() == "" {
+	if WebClient() == "" {
 		if len(path) > 0 && path[0:1] == "/" {
 			path = path[1:]
 		}
@@ -1142,9 +1198,9 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		dvid.SendHTTP(w, r, path, data)
 	} else {
-		filename := filepath.Join(config.WebClient(), path)
-		redirectURL := config.WebRedirectPath()
-		if len(redirectURL) > 0 || config.WebDefaultFile() != "" {
+		filename := filepath.Join(WebClient(), path)
+		redirectURL := WebRedirectPath()
+		if len(redirectURL) > 0 || WebDefaultFile() != "" {
 			_, err := os.Stat(filename)
 			if os.IsNotExist(err) {
 				if len(redirectURL) > 0 {
@@ -1154,7 +1210,7 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 					dvid.Debugf("[%s] Redirecting bad file (%s) to default path: %s\n", r.Method, filename, redirectURL)
 					http.Redirect(w, r, redirectURL, http.StatusPermanentRedirect)
 				} else {
-					filename = filepath.Join(config.WebClient(), config.WebDefaultFile())
+					filename = filepath.Join(WebClient(), WebDefaultFile())
 					dvid.Debugf("[%s] Serving default file from webclient directory: %s\n", r.Method, filename)
 					http.ServeFile(w, r, filename)
 				}
@@ -1307,6 +1363,44 @@ func serverReload(c web.C, w http.ResponseWriter, r *http.Request) {
 	datastore.MetadataUniversalUnlock()
 }
 
+func blobstoreHandler(c web.C, w http.ResponseWriter, r *http.Request) {
+	method := strings.ToLower(r.Method)
+	if method != "get" {
+		BadRequest(w, r, "blobstore only supports HTTP GET requests, not %q", method)
+		return
+	}
+	ref, ok := c.Env["ref"].(string)
+	if !ok {
+		BadRequest(w, r, "unable to parse blobstore reference in request %q", r.URL.Path)
+		return
+	}
+	mutConfig := MutationLogSpec()
+	if len(mutConfig.Blobstore) == 0 {
+		BadRequest(w, r, "Blobstore not configured.  Cannot fulfill %q", r.URL.Path)
+		return
+	}
+	var err error
+	var store dvid.Store
+	if store, err = storage.GetStoreByAlias(mutConfig.Blobstore); err != nil {
+		BadRequest(w, r, "Blobstore not assigned a store in config.  Cannot fulfill %q", r.URL.Path)
+		return
+	}
+	blobstore, ok := store.(storage.BlobStore)
+	if !ok {
+		BadRequest(w, r, "mutation blobstore %q is not a valid blob store", mutConfig.Blobstore)
+		return
+	}
+	var data []byte
+	if data, err = blobstore.GetBlob(ref); err != nil {
+		BadRequest(w, r, "error getting reference %q from blobstore: %v", ref, err)
+		return
+	}
+	w.Header().Set("Content-type", "application/octet-stream")
+	if _, err = w.Write(data); err != nil {
+		BadRequest(w, r, "error writing %d bytes (ref %q) to client: %v", len(data), ref, err)
+	}
+}
+
 func reposInfoHandler(w http.ResponseWriter, r *http.Request) {
 	jsonBytes, err := datastore.MarshalJSON()
 	if err != nil {
@@ -1388,6 +1482,18 @@ func repoHeadHandler(c web.C, w http.ResponseWriter, r *http.Request) {
 func repoInfoHandler(c web.C, w http.ResponseWriter, r *http.Request) {
 	uuid := (c.Env["uuid"]).(dvid.UUID)
 	jsonStr, err := datastore.GetRepoJSON(uuid)
+	if err != nil {
+		BadRequest(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, jsonStr)
+}
+
+func repoBranchVersionsHandler(c web.C, w http.ResponseWriter, r *http.Request) {
+	uuid := (c.Env["uuid"]).(dvid.UUID)
+	name := (c.Env["name"]).(string)
+	jsonStr, err := datastore.GetBranchVersionsJSON(uuid, name)
 	if err != nil {
 		BadRequest(w, r, err)
 		return

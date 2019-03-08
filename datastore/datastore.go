@@ -29,6 +29,12 @@ var (
 	manager *repoManager
 )
 
+// BlobService is an interface for storing and retrieving data based on its content.
+type BlobService interface {
+	GetBlob(ref string) (data []byte, err error)
+	PutBlob(data []byte) (ref string, err error)
+}
+
 // Shutdown sends signal for all goroutines for data processing to be terminated.
 func Shutdown() {
 	if manager == nil {
@@ -127,6 +133,13 @@ func GetRepoJSON(uuid dvid.UUID) (string, error) {
 		return "", ErrManagerNotInitialized
 	}
 	return manager.getRepoJSON(uuid)
+}
+
+func GetBranchVersionsJSON(uuid dvid.UUID, name string) (string, error) {
+	if manager == nil {
+		return "", ErrManagerNotInitialized
+	}
+	return manager.getBranchVersionsJSON(uuid, name)
 }
 
 func GetRepoAlias(uuid dvid.UUID) (string, error) {
